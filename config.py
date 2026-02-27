@@ -2,44 +2,48 @@
 Конфигурация системы потоковой передачи видео
 """
 
-# Разрешение видео
-VIDEO_WIDTH = 128
-VIDEO_HEIGHT = 64
-TOTAL_PIXELS = VIDEO_WIDTH * VIDEO_HEIGHT  # 8192 пикселей = 1024 байта в сыром виде
+# === SERIAL PORT ===
+SERIAL_PORT_TX = "/dev/ttyUSB0"
+SERIAL_PORT_RX = "/dev/ttyUSB1"
+SERIAL_BAUDRATE = 38400
 
-# Параметры Canny edge detection
-CANNY_THRESHOLD_1 = 120
+# === PACKET STRUCTURE ===
+PACKET_SIZE = 128
+PACKETS_PER_SECOND = 25
+PACKET_INTERVAL_MS = 40
+
+# === PROTOCOL HEADER ===
+SYNC_MAGIC = b'\xAA\xBB'
+HEADER_SIZE = 5
+PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE  # 123 байта
+
+# === FRAME TYPES ===
+FRAME_TYPE_KEY = 0x01
+FRAME_TYPE_DELTA = 0x02
+FRAME_TYPE_CONTINUATION = 0x03
+
+# === VIDEO PARAMETERS ===
+FRAME_WIDTH = 128
+FRAME_HEIGHT = 64
+FRAME_PIXELS = FRAME_WIDTH * FRAME_HEIGHT
+
+# === EDGE DETECTION ===
+CANNY_THRESHOLD_1 = 180
 CANNY_THRESHOLD_2 = 220
-
-# Параметры дилатации
 DILATE_KERNEL_SIZE = 1
 DILATE_ITERATIONS = 1
 
-# Параметры кодека
-KEYFRAME_INTERVAL = 10  # Каждые 10 кадров - keyframe
-BLOCK_SIZE = 4  # Размер блока для блочного кодирования (4x4)
+# === CODEC ===
+KEYFRAME_INTERVAL = 10
 
-# Параметры протокола
-SYNC_MAGIC = b'\xAA\xBB'
-PACKET_SIZE = 128  # Строго 128 байт
-HEADER_SIZE = 5  # SYNC(2) + frame_id(1) + frame_type(1) + packet_seq(1)
-PAYLOAD_SIZE = PACKET_SIZE - HEADER_SIZE  # 123 байта полезной нагрузки
+# === LEAKY BUCKET (уменьшено для низкой задержки!) ===
+# Максимум ~2-3 пакета в буфере, не больше
+BUCKET_MAX_SIZE = PACKET_SIZE * 30  # ~384 байт = 3 пакета
 
-# Типы кадров
-FRAME_TYPE_KEY = 0x01
-FRAME_TYPE_DELTA = 0x02
-FRAME_TYPE_CONTINUATION = 0x03  # Продолжение данных кадра
+# === TIMING ===
+CAMERA_FPS_TARGET = 15  # Уменьшено чтобы не создавать очередь
+DISPLAY_WAIT_MS = 1
 
-# Параметры последовательного порта
-SERIAL_PORT_TX = '/dev/ttyUSB0'
-SERIAL_PORT_RX = '/dev/ttyUSB1'
-BAUD_RATE = 38400
-
-# Параметры потока
-TARGET_PACKETS_PER_SECOND = 25  # ~25 пакетов/сек
-PACKET_INTERVAL = 1.0 / TARGET_PACKETS_PER_SECOND  # 40ms между пакетами
-TARGET_FPS = 10  # Целевой FPS (между 5-10)
-
-# Параметры буферизации
-MAX_PACKETS_PER_FRAME = 12  # Максимум пакетов на кадр (с запасом)
-FRAME_TIMEOUT = 0.5  # Таймаут сборки кадра в секундах
+# === DEBUG ===
+DEBUG_PRINT_STATS = True
+STATS_INTERVAL_SEC = 2

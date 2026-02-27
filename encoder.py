@@ -1,240 +1,413 @@
 """
-Encoder (Sender): Захват, обработка, сжатие и отправка видео
+Энкодер: захват видео, обработка, сжатие и отправка
+Реализует паттерн "Leaky Bucket"
 """
 
 import cv2
 import numpy as np
 import serial
+import threading
 import time
+import queue
 from typing import Optional
+from collections import deque
 
 from config import (
-    VIDEO_WIDTH, VIDEO_HEIGHT,
+    SERIAL_PORT_TX, SERIAL_BAUDRATE,
+    FRAME_WIDTH, FRAME_HEIGHT,
     CANNY_THRESHOLD_1, CANNY_THRESHOLD_2,
     DILATE_KERNEL_SIZE, DILATE_ITERATIONS,
-    KEYFRAME_INTERVAL,
-    SERIAL_PORT_TX, BAUD_RATE,
-    TARGET_FPS, PACKET_INTERVAL
+    PACKET_SIZE, PAYLOAD_SIZE, PACKETS_PER_SECOND, PACKET_INTERVAL_MS,
+    BUCKET_MAX_SIZE,
+    DEBUG_PRINT_STATS, STATS_INTERVAL_SEC,
+    DISPLAY_WAIT_MS
 )
-from codec import EdgeCodec
-from protocol import PacketBuilder
+from codec import FrameEncoder
+from protocol import PacketPacker
 
 
-class VideoEncoder:
-    """Захват и обработка видео"""
+class LeakyBucket:
+    """
+    Потокобезопасный буфер "Дырявое ведро"
+    Данные добавляются с переменной скоростью,
+    извлекаются со строго фиксированной скоростью
+    """
     
-    def __init__(self):
-        self.cap = None
+    def __init__(self, max_size: int = BUCKET_MAX_SIZE):
+        self.buffer: bytearray = bytearray()
+        self.lock = threading.Lock()
+        self.max_size = max_size
+        self.overflow_count = 0
+    
+    def add(self, data: bytes) -> bool:
+        """
+        Добавляет данные в буфер
+        
+        Returns:
+            True если добавлено, False если переполнение
+        """
+        with self.lock:
+            if len(self.buffer) + len(data) > self.max_size:
+                # Переполнение - отбрасываем старые данные
+                overflow = len(self.buffer) + len(data) - self.max_size
+                del self.buffer[:overflow]
+                self.overflow_count += 1
+            
+            self.buffer.extend(data)
+            return True
+    
+    def drain(self, size: int) -> bytes:
+        """
+        Извлекает данные из буфера
+        
+        Args:
+            size: количество байт для извлечения
+            
+        Returns:
+            Извлеченные данные (может быть меньше size)
+        """
+        with self.lock:
+            actual_size = min(size, len(self.buffer))
+            data = bytes(self.buffer[:actual_size])
+            del self.buffer[:actual_size]
+            return data
+    
+    def size(self) -> int:
+        """Текущий размер буфера"""
+        with self.lock:
+            return len(self.buffer)
+    
+    def clear(self):
+        """Очистка буфера"""
+        with self.lock:
+            self.buffer.clear()
+
+
+class VideoProcessor:
+    """
+    Обработчик видео: захват, edge detection, бинаризация
+    """
+    
+    def __init__(self, camera_id: int = 0):
+        self.camera_id = camera_id
+        self.cap: Optional[cv2.VideoCapture] = None
         self.dilate_kernel = np.ones(
             (DILATE_KERNEL_SIZE, DILATE_KERNEL_SIZE), 
             np.uint8
         )
     
-    def open(self, camera_id: int = 0) -> bool:
+    def open(self) -> bool:
         """Открывает камеру"""
-        self.cap = cv2.VideoCapture(camera_id)
-        
+        self.cap = cv2.VideoCapture(self.camera_id)
         if not self.cap.isOpened():
+            print(f"[ENCODER] Failed to open camera {self.camera_id}")
             return False
         
-        # Минимизируем буферизацию камеры
+        # Настройка камеры для низкой задержки
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        
-        # Устанавливаем минимальное разрешение для скорости
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
         
+        print(f"[ENCODER] Camera opened: {self.camera_id}")
         return True
     
-    def capture_frame(self) -> Optional[np.ndarray]:
-        """Захватывает кадр с камеры"""
-        if self.cap is None:
-            return None
+    def close(self):
+        """Закрывает камеру"""
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+    
+    def capture_and_process(self) -> Optional[np.ndarray]:
+        """
+        Захватывает кадр и применяет обработку
         
-        # Пропускаем буферизированные кадры
-        self.cap.grab()
+        Returns:
+            Бинарное изображение (64x128) с 0/1 или None
+        """
+        if not self.cap:
+            return None
         
         ret, frame = self.cap.read()
         if not ret:
             return None
         
-        return frame
-    
-    def process_frame(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Обрабатывает кадр:
-        1. Resize до 128x64
-        2. Grayscale
-        3. Canny edge detection
-        4. Dilate
-        5. Бинаризация (строго 0/1)
-        """
-        # Resize
-        resized = cv2.resize(frame, (VIDEO_WIDTH, VIDEO_HEIGHT), 
+        # Преобразование в оттенки серого
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Ресайз до целевого разрешения
+        resized = cv2.resize(gray, (FRAME_WIDTH, FRAME_HEIGHT), 
                             interpolation=cv2.INTER_AREA)
         
-        # Grayscale
-        if len(resized.shape) == 3:
-            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = resized
-        
         # Canny edge detection
-        edges = cv2.Canny(gray, CANNY_THRESHOLD_1, CANNY_THRESHOLD_2)
+        edges = cv2.Canny(resized, CANNY_THRESHOLD_1, CANNY_THRESHOLD_2)
         
-        # Dilate для утолщения линий
+        # Дилатация для усиления границ
         dilated = cv2.dilate(edges, self.dilate_kernel, 
                             iterations=DILATE_ITERATIONS)
         
-        # Бинаризация: строго 0 или 255
-        _, binary = cv2.threshold(dilated, 127, 255, cv2.THRESH_BINARY)
+        # Бинаризация: 0 или 1
+        binary = (dilated > 127).astype(np.uint8)
         
         return binary
-    
-    def close(self):
-        """Закрывает камеру"""
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
 
 
-class Sender:
-    """Главный класс отправителя"""
+class SerialSender:
+    """
+    Отправщик данных через последовательный порт
+    """
     
-    def __init__(self):
-        self.encoder = VideoEncoder()
-        self.codec = EdgeCodec()
-        self.packet_builder = PacketBuilder()
-        self.serial_port = None
-        self.frame_count = 0
-        self.running = False
+    def __init__(self, port: str, baudrate: int):
+        self.port = port
+        self.baudrate = baudrate
+        self.serial: Optional[serial.Serial] = None
     
-    def open_serial(self) -> bool:
-        """Открывает последовательный порт"""
+    def open(self) -> bool:
+        """Открывает порт"""
         try:
-            self.serial_port = serial.Serial(
-                port=SERIAL_PORT_TX,
-                baudrate=BAUD_RATE,
+            self.serial = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
-                timeout=0,  # Неблокирующий режим
+                timeout=0.01,
                 write_timeout=0.1
             )
+            print(f"[ENCODER] Serial port opened: {self.port} @ {self.baudrate}")
             return True
-        except serial.SerialException as e:
-            print(f"[Sender] Serial error: {e}")
+        except Exception as e:
+            print(f"[ENCODER] Failed to open serial port: {e}")
             return False
     
-    def run(self):
-        """Главный цикл отправителя"""
-        print("[Sender] Starting...")
-        
-        # Открываем камеру
-        if not self.encoder.open():
-            print("[Sender] Failed to open camera!")
+    def close(self):
+        """Закрывает порт"""
+        if self.serial:
+            self.serial.close()
+            self.serial = None
+    
+    def send(self, data: bytes) -> bool:
+        """Отправляет данные"""
+        if not self.serial:
+            return False
+        try:
+            self.serial.write(data)
+            self.serial.flush()
+            return True
+        except Exception as e:
+            print(f"[ENCODER] Serial write error: {e}")
+            return False
+
+
+class EncoderStats:
+    """Статистика энкодера"""
+    
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.frames_captured = 0
+        self.frames_encoded = 0
+        self.packets_sent = 0
+        self.bytes_sent = 0
+        self.overflows = 0
+        self.start_time = time.time()
+        self.last_print_time = time.time()
+    
+    def print_stats(self):
+        """Выводит статистику"""
+        elapsed = time.time() - self.start_time
+        if elapsed < 0.1:
             return
         
-        # Открываем порт
-        if not self.open_serial():
-            print("[Sender] Failed to open serial port!")
-            self.encoder.close()
-            return
+        fps_capture = self.frames_captured / elapsed
+        fps_encoded = self.frames_encoded / elapsed
+        pps = self.packets_sent / elapsed
+        kbps = (self.bytes_sent * 8 / 1000) / elapsed
         
-        print("[Sender] Camera and serial port opened")
+        print(f"[STATS] Cap:{fps_capture:.1f}fps Enc:{fps_encoded:.1f}fps "
+              f"Pkt:{pps:.1f}pps {kbps:.1f}kbps OVF:{self.overflows}")
+
+
+class Encoder:
+    """
+    Главный класс энкодера
+    Управляет потоками захвата и отправки
+    """
+    
+    def __init__(self, camera_id: int = 0):
+        self.camera_id = camera_id
+        self.processor = VideoProcessor(camera_id)
+        self.sender = SerialSender(SERIAL_PORT_TX, SERIAL_BAUDRATE)
+        self.frame_encoder = FrameEncoder()
+        self.packer = PacketPacker()
+        self.bucket = LeakyBucket(BUCKET_MAX_SIZE)
+        self.stats = EncoderStats()
+        
+        self.running = False
+        self.capture_thread: Optional[threading.Thread] = None
+        self.send_thread: Optional[threading.Thread] = None
+        
+        # Для отображения
+        self.display_frame: Optional[np.ndarray] = None
+        self.display_lock = threading.Lock()
+    
+    def start(self):
+        """Запускает энкодер"""
+        if not self.processor.open():
+            return False
+        
+        if not self.sender.open():
+            self.processor.close()
+            return False
         
         self.running = True
-        last_frame_time = 0
-        frame_interval = 1.0 / TARGET_FPS
+        self.stats.reset()
         
-        stats_time = time.monotonic()
-        stats_frames = 0
-        stats_packets = 0
+        # Запуск потоков
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
         
-        try:
-            while self.running:
-                current_time = time.monotonic()
-                
-                # === Отправка пакетов (приоритет - равномерность) ===
-                packet = self.packet_builder.get_next_packet()
-                if packet is not None:
-                    try:
-                        self.serial_port.write(packet)
-                        stats_packets += 1
-                    except serial.SerialException as e:
-                        print(f"[Sender] Write error: {e}")
-                
-                # === Захват и обработка кадров ===
-                if current_time - last_frame_time >= frame_interval:
-                    # Контролируем размер очереди
-                    self.packet_builder.clear_old_frames(keep_last=2)
-                    
-                    frame = self.encoder.capture_frame()
-                    if frame is not None:
-                        # Обработка
-                        binary = self.encoder.process_frame(frame)
-                        
-                        # Определяем тип кадра
-                        force_keyframe = (self.frame_count % KEYFRAME_INTERVAL == 0)
-                        
-                        # Кодирование
-                        frame_type, compressed = self.codec.encode(binary, force_keyframe)
-                        
-                        # Добавляем в очередь пакетов
-                        self.packet_builder.add_frame(frame_type, compressed)
-                        
-                        self.frame_count += 1
-                        stats_frames += 1
-                        last_frame_time = current_time
-                        
-                        # Отображение
-                        display = cv2.resize(binary, (512, 256), 
-                                           interpolation=cv2.INTER_NEAREST)
-                        cv2.imshow("Sender View", display)
-                
-                # === UI Events ===
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q') or key == 27:  # 'q' или ESC
-                    break
-                
-                # === Статистика ===
-                if current_time - stats_time >= 5.0:
-                    elapsed = current_time - stats_time
-                    fps = stats_frames / elapsed
-                    pps = stats_packets / elapsed
-                    queue_size = self.packet_builder.queue_size()
-                    print(f"[Sender] FPS: {fps:.1f}, Packets/s: {pps:.1f}, Queue: {queue_size}")
-                    stats_time = current_time
-                    stats_frames = 0
-                    stats_packets = 0
-                
-                # === Минимальный sleep для экономии CPU ===
-                wait_time = self.packet_builder.time_until_next()
-                if wait_time > 0.001:
-                    time.sleep(min(wait_time, 0.005))
+        self.capture_thread.start()
+        self.send_thread.start()
         
-        except KeyboardInterrupt:
-            print("\n[Sender] Interrupted")
-        finally:
-            self.cleanup()
+        print("[ENCODER] Started")
+        return True
     
-    def cleanup(self):
-        """Очистка ресурсов"""
+    def stop(self):
+        """Останавливает энкодер"""
         self.running = False
-        self.encoder.close()
         
-        if self.serial_port is not None:
-            self.serial_port.close()
+        if self.capture_thread:
+            self.capture_thread.join(timeout=1.0)
+        if self.send_thread:
+            self.send_thread.join(timeout=1.0)
         
+        self.processor.close()
+        self.sender.close()
         cv2.destroyAllWindows()
-        print("[Sender] Stopped")
+        
+        print("[ENCODER] Stopped")
+    
+    def _capture_loop(self):
+        """
+        Поток захвата и обработки видео
+        Работает максимально быстро
+        """
+        while self.running:
+            # Захват и обработка
+            binary_frame = self.processor.capture_and_process()
+            if binary_frame is None:
+                time.sleep(0.01)
+                continue
+            
+            self.stats.frames_captured += 1
+            
+            # Кодирование
+            encoded_data, frame_type, frame_num = self.frame_encoder.encode(binary_frame)
+            self.stats.frames_encoded += 1
+            
+            # Добавление в packer
+            self.packer.add_frame(encoded_data, frame_type)
+            
+            # Перекачка данных из packer в bucket
+            while self.packer.has_data():
+                packet = self.packer.get_next_packet()
+                if packet:
+                    self.bucket.add(packet)
+            
+            # Обновление кадра для отображения
+            with self.display_lock:
+                # Преобразуем 0/1 в 0/255 для отображения
+                self.display_frame = (binary_frame * 255).astype(np.uint8)
+            
+            # Небольшая пауза чтобы не перегружать CPU
+            time.sleep(0.001)
+    
+    def _send_loop(self):
+        """
+        Поток отправки пакетов
+        Строго 25 пакетов в секунду
+        """
+        interval = PACKET_INTERVAL_MS / 1000.0  # 40 мс
+        next_send_time = time.time()
+        
+        while self.running:
+            now = time.time()
+            
+            if now >= next_send_time:
+                # Время отправлять пакет
+                # Извлекаем данные из bucket
+                data = self.bucket.drain(PACKET_SIZE)
+                
+                if len(data) == PACKET_SIZE:
+                    # Отправляем полный пакет
+                    if self.sender.send(data):
+                        self.stats.packets_sent += 1
+                        self.stats.bytes_sent += len(data)
+                
+                # Планируем следующую отправку
+                next_send_time += interval
+                
+                # Защита от накопления отставания
+                if next_send_time < now - interval:
+                    next_send_time = now + interval
+            
+            # Точный сон до следующей отправки
+            sleep_time = next_send_time - time.time()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+    
+    def run_display(self):
+        """
+        Основной цикл отображения (должен выполняться в главном потоке)
+        """
+        last_stats_time = time.time()
+        
+        while self.running:
+            # Получаем кадр для отображения
+            frame_to_show = None
+            with self.display_lock:
+                if self.display_frame is not None:
+                    frame_to_show = self.display_frame.copy()
+            
+            if frame_to_show is not None:
+                # Увеличиваем для лучшей видимости
+                display = cv2.resize(frame_to_show, (512, 256), 
+                                    interpolation=cv2.INTER_NEAREST)
+                
+                # Добавляем информацию
+                cv2.putText(display, f"Bucket: {self.bucket.size()} bytes", 
+                           (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1)
+                cv2.putText(display, f"Packets: {self.stats.packets_sent}", 
+                           (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1)
+                
+                cv2.imshow("Sender View", display)
+            
+            # Вывод статистики
+            if DEBUG_PRINT_STATS and time.time() - last_stats_time > STATS_INTERVAL_SEC:
+                self.stats.overflows = self.bucket.overflow_count
+                self.stats.print_stats()
+                last_stats_time = time.time()
+            
+            # Обработка нажатий клавиш
+            key = cv2.waitKey(DISPLAY_WAIT_MS) & 0xFF
+            if key == ord('q') or key == 27:  # q или ESC
+                self.running = False
+                break
 
 
-def main():
-    """Точка входа для encoder"""
-    sender = Sender()
-    sender.run()
+def run_encoder(camera_id: int = 0):
+    """Функция запуска энкодера"""
+    encoder = Encoder(camera_id)
+    
+    try:
+        if encoder.start():
+            encoder.run_display()
+    except KeyboardInterrupt:
+        print("\n[ENCODER] Interrupted")
+    finally:
+        encoder.stop()
 
 
 if __name__ == "__main__":
-    main()
+    run_encoder()
