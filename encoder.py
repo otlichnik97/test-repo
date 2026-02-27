@@ -1,5 +1,5 @@
 """
-Encoder (Sender): Захват видео, обработка, сжатие и отправка
+Encoder (Sender): Захват, обработка, сжатие и отправка видео
 """
 
 import cv2
@@ -7,45 +7,71 @@ import numpy as np
 import serial
 import time
 from typing import Optional
+
 from config import (
     VIDEO_WIDTH, VIDEO_HEIGHT,
-    SERIAL_PORT_TX, BAUD_RATE,
-    CANNY_THRESHOLD1, CANNY_THRESHOLD2,
+    CANNY_THRESHOLD_1, CANNY_THRESHOLD_2,
     DILATE_KERNEL_SIZE, DILATE_ITERATIONS,
-    DISPLAY_SCALE, WINDOW_NAME_SENDER,
-    TARGET_FPS, MAX_COMPRESSED_SIZE, TARGET_COMPRESSED_SIZE,
-    DEBUG, SHOW_STATS, STATS_INTERVAL
+    KEYFRAME_INTERVAL,
+    SERIAL_PORT_TX, BAUD_RATE,
+    TARGET_FPS, PACKET_INTERVAL
 )
-from codec import compress
+from codec import EdgeCodec
 from protocol import PacketBuilder
 
 
-class VideoProcessor:
-    """Обработка видеокадров: resize, edge detection, binarization"""
+class VideoEncoder:
+    """Захват и обработка видео"""
     
     def __init__(self):
-        self._dilate_kernel = np.ones(
+        self.cap = None
+        self.dilate_kernel = np.ones(
             (DILATE_KERNEL_SIZE, DILATE_KERNEL_SIZE), 
             np.uint8
         )
     
-    def process(self, frame: np.ndarray) -> np.ndarray:
+    def open(self, camera_id: int = 0) -> bool:
+        """Открывает камеру"""
+        self.cap = cv2.VideoCapture(camera_id)
+        
+        if not self.cap.isOpened():
+            return False
+        
+        # Минимизируем буферизацию камеры
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        # Устанавливаем минимальное разрешение для скорости
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+        
+        return True
+    
+    def capture_frame(self) -> Optional[np.ndarray]:
+        """Захватывает кадр с камеры"""
+        if self.cap is None:
+            return None
+        
+        # Пропускаем буферизированные кадры
+        self.cap.grab()
+        
+        ret, frame = self.cap.read()
+        if not ret:
+            return None
+        
+        return frame
+    
+    def process_frame(self, frame: np.ndarray) -> np.ndarray:
         """
         Обрабатывает кадр:
         1. Resize до 128x64
         2. Grayscale
         3. Canny edge detection
-        4. Dilate для усиления линий
-        5. Бинаризация (0/255)
-        
-        Args:
-            frame: Входной кадр (BGR)
-            
-        Returns:
-            Бинарное изображение (128x64, значения 0 или 255)
+        4. Dilate
+        5. Бинаризация (строго 0/1)
         """
         # Resize
-        resized = cv2.resize(frame, (VIDEO_WIDTH, VIDEO_HEIGHT))
+        resized = cv2.resize(frame, (VIDEO_WIDTH, VIDEO_HEIGHT), 
+                            interpolation=cv2.INTER_AREA)
         
         # Grayscale
         if len(resized.shape) == 3:
@@ -54,230 +80,161 @@ class VideoProcessor:
             gray = resized
         
         # Canny edge detection
-        edges = cv2.Canny(gray, CANNY_THRESHOLD1, CANNY_THRESHOLD2)
+        edges = cv2.Canny(gray, CANNY_THRESHOLD_1, CANNY_THRESHOLD_2)
         
-        # Dilate для усиления тонких линий
-        dilated = cv2.dilate(
-            edges, 
-            self._dilate_kernel, 
-            iterations=DILATE_ITERATIONS
-        )
+        # Dilate для утолщения линий
+        dilated = cv2.dilate(edges, self.dilate_kernel, 
+                            iterations=DILATE_ITERATIONS)
         
-        # Финальная бинаризация (уже бинарное после Canny, но для надежности)
+        # Бинаризация: строго 0 или 255
         _, binary = cv2.threshold(dilated, 127, 255, cv2.THRESH_BINARY)
         
         return binary
+    
+    def close(self):
+        """Закрывает камеру"""
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
 
 
-class Encoder:
-    """Основной класс энкодера"""
+class Sender:
+    """Главный класс отправителя"""
     
-    def __init__(self, camera_id: int = 0):
-        self._camera_id = camera_id
-        self._processor = VideoProcessor()
-        self._frame_id = 0
-        self._serial: Optional[serial.Serial] = None
-        self._running = False
-        
-        # Статистика
-        self._stats_last_time = time.time()
-        self._stats_frames_captured = 0
-        self._stats_frames_sent = 0
-        self._stats_frames_dropped = 0
-        self._stats_bytes_sent = 0
+    def __init__(self):
+        self.encoder = VideoEncoder()
+        self.codec = EdgeCodec()
+        self.packet_builder = PacketBuilder()
+        self.serial_port = None
+        self.frame_count = 0
+        self.running = False
     
-    def _open_serial(self) -> bool:
+    def open_serial(self) -> bool:
         """Открывает последовательный порт"""
         try:
-            self._serial = serial.Serial(
+            self.serial_port = serial.Serial(
                 port=SERIAL_PORT_TX,
                 baudrate=BAUD_RATE,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
-                timeout=0.1,
-                write_timeout=1.0
+                timeout=0,  # Неблокирующий режим
+                write_timeout=0.1
             )
-            print(f"[ENCODER] Serial port {SERIAL_PORT_TX} opened at {BAUD_RATE} baud")
             return True
         except serial.SerialException as e:
-            print(f"[ENCODER] Failed to open serial port: {e}")
+            print(f"[Sender] Serial error: {e}")
             return False
-    
-    def _close_serial(self):
-        """Закрывает последовательный порт"""
-        if self._serial and self._serial.is_open:
-            self._serial.close()
-            print("[ENCODER] Serial port closed")
-    
-    def _send_frame(self, compressed_data: bytes) -> bool:
-        """
-        Отправляет сжатый кадр через последовательный порт.
-        
-        Args:
-            compressed_data: Сжатые данные кадра
-            
-        Returns:
-            True если отправка успешна
-        """
-        if not self._serial or not self._serial.is_open:
-            return False
-        
-        # Создаем пакеты
-        packets = PacketBuilder.create_packets(compressed_data, self._frame_id)
-        
-        # Отправляем пакеты
-        try:
-            for packet in packets:
-                self._serial.write(packet)
-                self._stats_bytes_sent += len(packet)
-            
-            self._serial.flush()
-            return True
-            
-        except serial.SerialException as e:
-            if DEBUG:
-                print(f"[ENCODER] Send error: {e}")
-            return False
-    
-    def _print_stats(self):
-        """Выводит статистику"""
-        now = time.time()
-        elapsed = now - self._stats_last_time
-        
-        if elapsed >= STATS_INTERVAL:
-            fps_captured = self._stats_frames_captured / elapsed
-            fps_sent = self._stats_frames_sent / elapsed
-            bytes_per_sec = self._stats_bytes_sent / elapsed
-            drop_rate = (self._stats_frames_dropped / max(1, self._stats_frames_captured)) * 100
-            
-            print(f"[ENCODER] Captured: {fps_captured:.1f} fps | "
-                  f"Sent: {fps_sent:.1f} fps | "
-                  f"Dropped: {drop_rate:.1f}% | "
-                  f"Bandwidth: {bytes_per_sec:.0f} B/s")
-            
-            self._stats_last_time = now
-            self._stats_frames_captured = 0
-            self._stats_frames_sent = 0
-            self._stats_frames_dropped = 0
-            self._stats_bytes_sent = 0
     
     def run(self):
-        """Главный цикл энкодера"""
+        """Главный цикл отправителя"""
+        print("[Sender] Starting...")
+        
         # Открываем камеру
-        cap = cv2.VideoCapture(self._camera_id)
-        if not cap.isOpened():
-            print(f"[ENCODER] Failed to open camera {self._camera_id}")
+        if not self.encoder.open():
+            print("[Sender] Failed to open camera!")
             return
         
-        print(f"[ENCODER] Camera {self._camera_id} opened")
-        
-        # Настройки камеры для низкого разрешения (экономия CPU)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-        cap.set(cv2.CAP_PROP_FPS, TARGET_FPS * 2)
-        
-        # Открываем последовательный порт
-        if not self._open_serial():
-            cap.release()
+        # Открываем порт
+        if not self.open_serial():
+            print("[Sender] Failed to open serial port!")
+            self.encoder.close()
             return
         
-        self._running = True
-        frame_interval = 1.0 / TARGET_FPS
+        print("[Sender] Camera and serial port opened")
+        
+        self.running = True
         last_frame_time = 0
+        frame_interval = 1.0 / TARGET_FPS
         
-        print(f"[ENCODER] Starting capture at {TARGET_FPS} fps target")
+        stats_time = time.monotonic()
+        stats_frames = 0
+        stats_packets = 0
         
         try:
-            while self._running:
-                # Читаем кадр
-                ret, frame = cap.read()
-                if not ret:
-                    print("[ENCODER] Failed to capture frame")
-                    time.sleep(0.01)
-                    continue
+            while self.running:
+                current_time = time.monotonic()
                 
-                self._stats_frames_captured += 1
+                # === Отправка пакетов (приоритет - равномерность) ===
+                packet = self.packet_builder.get_next_packet()
+                if packet is not None:
+                    try:
+                        self.serial_port.write(packet)
+                        stats_packets += 1
+                    except serial.SerialException as e:
+                        print(f"[Sender] Write error: {e}")
                 
-                # Контроль частоты кадров
-                current_time = time.time()
-                if current_time - last_frame_time < frame_interval:
-                    # Пропускаем кадр - слишком рано
-                    continue
+                # === Захват и обработка кадров ===
+                if current_time - last_frame_time >= frame_interval:
+                    # Контролируем размер очереди
+                    self.packet_builder.clear_old_frames(keep_last=2)
+                    
+                    frame = self.encoder.capture_frame()
+                    if frame is not None:
+                        # Обработка
+                        binary = self.encoder.process_frame(frame)
+                        
+                        # Определяем тип кадра
+                        force_keyframe = (self.frame_count % KEYFRAME_INTERVAL == 0)
+                        
+                        # Кодирование
+                        frame_type, compressed = self.codec.encode(binary, force_keyframe)
+                        
+                        # Добавляем в очередь пакетов
+                        self.packet_builder.add_frame(frame_type, compressed)
+                        
+                        self.frame_count += 1
+                        stats_frames += 1
+                        last_frame_time = current_time
+                        
+                        # Отображение
+                        display = cv2.resize(binary, (512, 256), 
+                                           interpolation=cv2.INTER_NEAREST)
+                        cv2.imshow("Sender View", display)
                 
-                # Обрабатываем кадр
-                binary = self._processor.process(frame)
-                
-                # Сжимаем
-                compressed = compress(binary)
-                
-                if compressed is None:
-                    # Кадр слишком большой - пропускаем
-                    self._stats_frames_dropped += 1
-                    if DEBUG:
-                        print("[ENCODER] Frame dropped: compression failed")
-                    continue
-                
-                if len(compressed) > MAX_COMPRESSED_SIZE:
-                    # Кадр слишком большой - пропускаем
-                    self._stats_frames_dropped += 1
-                    if DEBUG:
-                        print(f"[ENCODER] Frame dropped: {len(compressed)} > {MAX_COMPRESSED_SIZE}")
-                    continue
-                
-                # Отправляем
-                if self._send_frame(compressed):
-                    self._stats_frames_sent += 1
-                    self._frame_id = (self._frame_id + 1) & 0xFF
-                    last_frame_time = current_time
-                else:
-                    self._stats_frames_dropped += 1
-                
-                # Отображаем локально
-                display = cv2.resize(
-                    binary, 
-                    (VIDEO_WIDTH * DISPLAY_SCALE, VIDEO_HEIGHT * DISPLAY_SCALE),
-                    interpolation=cv2.INTER_NEAREST
-                )
-                
-                # Добавляем информацию
-                info_text = f"Size: {len(compressed)}B | FID: {self._frame_id}"
-                cv2.putText(
-                    display, info_text, (10, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,), 1
-                )
-                
-                cv2.imshow(WINDOW_NAME_SENDER, display)
-                
-                # Проверяем выход
+                # === UI Events ===
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord('q') or key == 27:
+                if key == ord('q') or key == 27:  # 'q' или ESC
                     break
                 
-                # Статистика
-                if SHOW_STATS:
-                    self._print_stats()
+                # === Статистика ===
+                if current_time - stats_time >= 5.0:
+                    elapsed = current_time - stats_time
+                    fps = stats_frames / elapsed
+                    pps = stats_packets / elapsed
+                    queue_size = self.packet_builder.queue_size()
+                    print(f"[Sender] FPS: {fps:.1f}, Packets/s: {pps:.1f}, Queue: {queue_size}")
+                    stats_time = current_time
+                    stats_frames = 0
+                    stats_packets = 0
+                
+                # === Минимальный sleep для экономии CPU ===
+                wait_time = self.packet_builder.time_until_next()
+                if wait_time > 0.001:
+                    time.sleep(min(wait_time, 0.005))
         
         except KeyboardInterrupt:
-            print("\n[ENCODER] Interrupted by user")
-        
+            print("\n[Sender] Interrupted")
         finally:
-            self._running = False
-            cap.release()
-            self._close_serial()
-            cv2.destroyWindow(WINDOW_NAME_SENDER)
-            print("[ENCODER] Stopped")
+            self.cleanup()
     
-    def stop(self):
-        """Останавливает энкодер"""
-        self._running = False
+    def cleanup(self):
+        """Очистка ресурсов"""
+        self.running = False
+        self.encoder.close()
+        
+        if self.serial_port is not None:
+            self.serial_port.close()
+        
+        cv2.destroyAllWindows()
+        print("[Sender] Stopped")
 
 
-def run_encoder(camera_id: int = 0):
-    """Точка входа для запуска энкодера"""
-    encoder = Encoder(camera_id)
-    encoder.run()
+def main():
+    """Точка входа для encoder"""
+    sender = Sender()
+    sender.run()
 
 
 if __name__ == "__main__":
-    run_encoder()
+    main()

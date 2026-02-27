@@ -1,344 +1,255 @@
 """
-Протокол упаковки/распаковки пакетов для передачи по последовательному порту
+Протокол упаковки/распаковки пакетов
+Обеспечивает равномерную передачу данных
 """
 
 import struct
-from typing import List, Optional, Tuple
-from dataclasses import dataclass
+import time
+from collections import deque
+from typing import Optional, Tuple, List
 from config import (
-    PACKET_SIZE, SYNC_MAGIC, HEADER_SIZE, PAYLOAD_MAX, DEBUG
+    SYNC_MAGIC, PACKET_SIZE, HEADER_SIZE, PAYLOAD_SIZE,
+    FRAME_TYPE_KEY, FRAME_TYPE_DELTA, FRAME_TYPE_CONTINUATION,
+    PACKET_INTERVAL, MAX_PACKETS_PER_FRAME
 )
 
 
-@dataclass
-class Packet:
-    """Структура пакета данных"""
-    frame_id: int      # ID кадра (0-255, циклический)
-    packet_seq: int    # Порядковый номер пакета в кадре
-    data_len: int      # Длина полезной нагрузки
-    payload: bytes     # Полезная нагрузка
-    
-    def is_last(self) -> bool:
-        """Проверяет, последний ли это пакет в кадре"""
-        return self.data_len < PAYLOAD_MAX
-
-
 class PacketBuilder:
-    """Создание пакетов из данных кадра"""
+    """Создаёт пакеты для передачи"""
     
-    @staticmethod
-    def create_packets(frame_data: bytes, frame_id: int) -> List[bytes]:
+    def __init__(self):
+        self.frame_id = 0
+        self.packet_queue = deque()  # Очередь готовых пакетов
+        self.last_send_time = 0
+    
+    def add_frame(self, frame_type: int, data: bytes):
         """
-        Разбивает данные кадра на пакеты.
-        
-        Args:
-            frame_data: Сжатые данные кадра
-            frame_id: ID кадра (0-255)
-            
-        Returns:
-            Список сырых пакетов для отправки
+        Добавляет кадр в очередь пакетов.
+        Разбивает данные на пакеты по PAYLOAD_SIZE байт.
         """
+        # Создаём пакеты для кадра
         packets = []
         offset = 0
         packet_seq = 0
         
-        while offset < len(frame_data):
-            # Вычисляем размер payload для этого пакета
-            remaining = len(frame_data) - offset
-            payload_size = min(remaining, PAYLOAD_MAX)
+        while offset < len(data):
+            chunk = data[offset:offset + PAYLOAD_SIZE]
+            offset += PAYLOAD_SIZE
             
-            # Извлекаем payload
-            payload = frame_data[offset:offset + payload_size]
+            # Определяем тип для этого пакета
+            if packet_seq == 0:
+                pkt_type = frame_type  # Первый пакет кадра
+            else:
+                pkt_type = FRAME_TYPE_CONTINUATION  # Продолжение
             
-            # Создаем пакет
-            packet = PacketBuilder._build_packet(
-                frame_id=frame_id & 0xFF,
-                packet_seq=packet_seq & 0xFF,
-                payload=payload
+            packet = self._build_packet(
+                self.frame_id, pkt_type, packet_seq, chunk
             )
             packets.append(packet)
-            
-            offset += payload_size
             packet_seq += 1
         
-        return packets
+        # Добавляем в очередь
+        for pkt in packets:
+            self.packet_queue.append(pkt)
+        
+        # Инкрементируем frame_id (циклический 0-255)
+        self.frame_id = (self.frame_id + 1) & 0xFF
     
-    @staticmethod
-    def _build_packet(frame_id: int, packet_seq: int, payload: bytes) -> bytes:
+    def _build_packet(self, frame_id: int, frame_type: int, 
+                      packet_seq: int, payload: bytes) -> bytes:
         """
-        Собирает один пакет.
-        
-        Структура:
-        - SYNC_MAGIC: 2 байта (0xAA 0xBB)
-        - frame_id: 1 байт
-        - packet_seq: 1 байт
-        - data_len: 1 байт
-        - payload: до 123 байт
-        
-        Args:
-            frame_id: ID кадра
-            packet_seq: Номер пакета
-            payload: Полезная нагрузка
-            
-        Returns:
-            Сырой пакет (до 128 байт)
+        Строит пакет ровно 128 байт.
+        Если payload меньше - дополняем данными для эффективности.
         """
-        data_len = len(payload)
-        
         # Заголовок
         header = struct.pack(
-            '>2sBBB',  # Big-endian: magic(2), frame_id(1), seq(1), len(1)
+            '>2sBBB',  # Big-endian: SYNC(2) + frame_id(1) + type(1) + seq(1)
             SYNC_MAGIC,
             frame_id,
-            packet_seq,
-            data_len
+            frame_type,
+            packet_seq
         )
         
-        # Собираем пакет (без паддинга!)
-        packet = header + payload
+        # Payload с выравниванием
+        if len(payload) < PAYLOAD_SIZE:
+            # Дополняем паттерном для синхронизации (не нули!)
+            # Используем длину реальных данных в последнем байте payload
+            padding_needed = PAYLOAD_SIZE - len(payload) - 1
+            padded = payload + bytes([0x55] * padding_needed) + bytes([len(payload)])
+        else:
+            padded = payload[:PAYLOAD_SIZE]
         
-        return packet
+        return header + padded
+    
+    def get_next_packet(self) -> Optional[bytes]:
+        """
+        Возвращает следующий пакет с учётом равномерной передачи.
+        Неблокирующая операция.
+        """
+        current_time = time.monotonic()
+        
+        # Проверяем, прошло ли достаточно времени
+        if current_time - self.last_send_time < PACKET_INTERVAL:
+            return None
+        
+        if self.packet_queue:
+            self.last_send_time = current_time
+            return self.packet_queue.popleft()
+        
+        return None
+    
+    def time_until_next(self) -> float:
+        """Возвращает время до следующей возможной отправки"""
+        elapsed = time.monotonic() - self.last_send_time
+        remaining = PACKET_INTERVAL - elapsed
+        return max(0, remaining)
+    
+    def queue_size(self) -> int:
+        """Размер очереди пакетов"""
+        return len(self.packet_queue)
+    
+    def clear_old_frames(self, keep_last: int = 2):
+        """
+        Очищает старые кадры из очереди, оставляя только последние.
+        Предотвращает накопление задержки.
+        """
+        if self.queue_size() > MAX_PACKETS_PER_FRAME * keep_last:
+            # Оставляем только последние пакеты
+            packets_to_keep = MAX_PACKETS_PER_FRAME * keep_last
+            while len(self.packet_queue) > packets_to_keep:
+                self.packet_queue.popleft()
 
 
 class PacketParser:
-    """Парсинг входящего потока данных"""
+    """Парсер входящих пакетов"""
     
     def __init__(self):
-        self._buffer = bytearray()
-        self._sync_found = False
+        self.buffer = bytearray()
+        self.frame_buffers = {}  # frame_id -> {packets: {seq: data}, type: int}
+        self.current_frame_id = None
+        self.last_complete_frame_id = None
     
-    def feed(self, data: bytes) -> List[Packet]:
+    def feed(self, data: bytes):
+        """Добавляет данные в буфер"""
+        self.buffer.extend(data)
+    
+    def parse_packets(self) -> List[Tuple[int, int, int, bytes]]:
         """
-        Добавляет данные в буфер и извлекает готовые пакеты.
-        
-        Args:
-            data: Входящие байты
-            
-        Returns:
-            Список распознанных пакетов
+        Парсит все доступные пакеты из буфера.
+        Возвращает список: [(frame_id, frame_type, packet_seq, payload), ...]
         """
-        self._buffer.extend(data)
         packets = []
         
-        while True:
-            packet = self._try_extract_packet()
-            if packet is None:
-                break
-            packets.append(packet)
-        
-        # Ограничиваем размер буфера (защита от переполнения)
-        if len(self._buffer) > PACKET_SIZE * 10:
-            # Ищем последний SYNC_MAGIC и отбрасываем все до него
-            last_sync = self._buffer.rfind(SYNC_MAGIC)
-            if last_sync > 0:
-                self._buffer = self._buffer[last_sync:]
-            elif last_sync < 0:
-                self._buffer.clear()
-        
-        return packets
-    
-    def _try_extract_packet(self) -> Optional[Packet]:
-        """
-        Пытается извлечь один пакет из буфера.
-        
-        Returns:
-            Распознанный пакет или None
-        """
-        # Ищем SYNC_MAGIC
-        while len(self._buffer) >= HEADER_SIZE:
-            sync_pos = self._buffer.find(SYNC_MAGIC)
+        while len(self.buffer) >= PACKET_SIZE:
+            # Ищем SYNC_MAGIC
+            sync_pos = self.buffer.find(SYNC_MAGIC)
             
-            if sync_pos < 0:
-                # SYNC не найден - оставляем последний байт (может быть частью SYNC)
-                if len(self._buffer) > 1:
-                    self._buffer = self._buffer[-1:]
-                return None
+            if sync_pos == -1:
+                # Нет синхронизации, оставляем последний байт (может быть частью SYNC)
+                if len(self.buffer) > 1:
+                    self.buffer = self.buffer[-1:]
+                break
             
             if sync_pos > 0:
-                # Отбрасываем мусор перед SYNC
-                if DEBUG:
-                    print(f"[PROTO] Discarding {sync_pos} bytes before SYNC")
-                self._buffer = self._buffer[sync_pos:]
+                # Отбрасываем мусор до синхронизации
+                self.buffer = self.buffer[sync_pos:]
             
-            # Проверяем, достаточно ли данных для заголовка
-            if len(self._buffer) < HEADER_SIZE:
-                return None
+            if len(self.buffer) < PACKET_SIZE:
+                break
+            
+            # Извлекаем пакет
+            packet = bytes(self.buffer[:PACKET_SIZE])
+            self.buffer = self.buffer[PACKET_SIZE:]
             
             # Парсим заголовок
             try:
-                _, frame_id, packet_seq, data_len = struct.unpack(
-                    '>2sBBB',
-                    bytes(self._buffer[:HEADER_SIZE])
+                _, frame_id, frame_type, packet_seq = struct.unpack(
+                    '>2sBBB', packet[:HEADER_SIZE]
                 )
+                payload = packet[HEADER_SIZE:]
+                
+                # Извлекаем реальную длину из последнего байта для неполных пакетов
+                if frame_type == FRAME_TYPE_CONTINUATION or packet_seq > 0:
+                    # Для continuation пакетов проверяем маркер длины
+                    pass  # Длина обрабатывается при сборке кадра
+                
+                packets.append((frame_id, frame_type, packet_seq, payload))
+                
             except struct.error:
-                self._buffer = self._buffer[2:]  # Пропускаем неверный SYNC
                 continue
+        
+        return packets
+    
+    def process_packet(self, frame_id: int, frame_type: int, 
+                       packet_seq: int, payload: bytes) -> Optional[Tuple[int, bytes]]:
+        """
+        Обрабатывает пакет и пытается собрать кадр.
+        Возвращает (frame_type, data) если кадр собран, иначе None.
+        
+        Реализует логику Low Latency: новый frame_id сбрасывает старый буфер.
+        """
+        # Если пришёл новый кадр, сбрасываем предыдущие
+        if self.current_frame_id is not None and frame_id != self.current_frame_id:
+            # Проверяем, что это действительно новый кадр (учитываем циклический ID)
+            id_diff = (frame_id - self.current_frame_id) & 0xFF
+            if id_diff > 0 and id_diff < 128:  # Новый кадр (не старый повтор)
+                # Сбрасываем старый буфер
+                self.frame_buffers.clear()
+        
+        self.current_frame_id = frame_id
+        
+        # Инициализируем буфер для кадра
+        if frame_id not in self.frame_buffers:
+            self.frame_buffers[frame_id] = {
+                'packets': {},
+                'type': None,
+                'expected_end': False
+            }
+        
+        fb = self.frame_buffers[frame_id]
+        
+        # Сохраняем тип кадра (из первого пакета)
+        if frame_type in (FRAME_TYPE_KEY, FRAME_TYPE_DELTA):
+            fb['type'] = frame_type
+        
+        # Сохраняем payload
+        fb['packets'][packet_seq] = payload
+        
+        # Пытаемся собрать кадр
+        # Кадр считается полным, если:
+        # 1. Есть пакет seq=0
+        # 2. Все пакеты последовательны до максимального seq
+        if 0 in fb['packets'] and fb['type'] is not None:
+            max_seq = max(fb['packets'].keys())
             
-            # Валидация data_len
-            if data_len > PAYLOAD_MAX:
-                if DEBUG:
-                    print(f"[PROTO] Invalid data_len: {data_len}, skipping")
-                self._buffer = self._buffer[2:]
-                continue
+            # Проверяем непрерывность
+            all_present = all(i in fb['packets'] for i in range(max_seq + 1))
             
-            # Проверяем, есть ли полный пакет
-            packet_total_size = HEADER_SIZE + data_len
-            if len(self._buffer) < packet_total_size:
-                return None
-            
-            # Извлекаем payload
-            payload = bytes(self._buffer[HEADER_SIZE:packet_total_size])
-            
-            # Удаляем пакет из буфера
-            self._buffer = self._buffer[packet_total_size:]
-            
-            return Packet(
-                frame_id=frame_id,
-                packet_seq=packet_seq,
-                data_len=data_len,
-                payload=payload
-            )
+            if all_present:
+                # Собираем данные
+                full_data = bytearray()
+                for seq in range(max_seq + 1):
+                    pkt_payload = fb['packets'][seq]
+                    
+                    # Для последнего пакета извлекаем реальную длину
+                    if seq == max_seq:
+                        real_len = pkt_payload[-1]
+                        if real_len > 0 and real_len < PAYLOAD_SIZE:
+                            pkt_payload = pkt_payload[:real_len]
+                        # Если real_len == PAYLOAD_SIZE, данные полные
+                    
+                    full_data.extend(pkt_payload)
+                
+                # Очищаем буфер этого кадра
+                del self.frame_buffers[frame_id]
+                self.last_complete_frame_id = frame_id
+                
+                return (fb['type'], bytes(full_data))
         
         return None
     
     def reset(self):
-        """Сбрасывает буфер парсера"""
-        self._buffer.clear()
-        self._sync_found = False
-
-
-class FrameAssembler:
-    """Сборка кадров из пакетов"""
-    
-    def __init__(self):
-        self._current_frame_id: Optional[int] = None
-        self._packets: dict = {}  # packet_seq -> payload
-        self._expected_packets: Optional[int] = None
-    
-    def add_packet(self, packet: Packet) -> Optional[bytes]:
-        """
-        Добавляет пакет и пытается собрать кадр.
-        
-        Логика Low Latency:
-        - Если пришел пакет с новым frame_id - сбрасываем буфер
-        - Приоритет всегда у самого свежего кадра
-        
-        Args:
-            packet: Входящий пакет
-            
-        Returns:
-            Собранные данные кадра или None
-        """
-        # Проверяем, новый ли это кадр
-        if self._current_frame_id is not None:
-            # Вычисляем "расстояние" между frame_id (с учетом циклического переполнения)
-            diff = (packet.frame_id - self._current_frame_id) & 0xFF
-            
-            # Если новый кадр (diff > 0 и < 128) - сбрасываем старый
-            if 0 < diff < 128:
-                if DEBUG and len(self._packets) > 0:
-                    print(f"[PROTO] Dropping incomplete frame {self._current_frame_id}, "
-                          f"switching to {packet.frame_id}")
-                self._reset()
-        
-        # Начинаем сборку нового кадра
-        if self._current_frame_id is None:
-            self._current_frame_id = packet.frame_id
-        
-        # Пропускаем пакеты от старых кадров
-        if packet.frame_id != self._current_frame_id:
-            return None
-        
-        # Сохраняем пакет
-        self._packets[packet.packet_seq] = packet.payload
-        
-        # Проверяем, последний ли это пакет
-        if packet.is_last():
-            self._expected_packets = packet.packet_seq + 1
-        
-        # Пробуем собрать кадр
-        return self._try_assemble()
-    
-    def _try_assemble(self) -> Optional[bytes]:
-        """
-        Пытается собрать полный кадр.
-        
-        Returns:
-            Данные кадра или None
-        """
-        if self._expected_packets is None:
-            return None
-        
-        # Проверяем, все ли пакеты получены
-        if len(self._packets) < self._expected_packets:
-            return None
-        
-        # Собираем данные в правильном порядке
-        try:
-            frame_data = bytearray()
-            for seq in range(self._expected_packets):
-                if seq not in self._packets:
-                    if DEBUG:
-                        print(f"[PROTO] Missing packet {seq} in frame {self._current_frame_id}")
-                    self._reset()
-                    return None
-                frame_data.extend(self._packets[seq])
-            
-            # Успешно собрали кадр
-            result = bytes(frame_data)
-            self._reset()
-            return result
-            
-        except Exception as e:
-            if DEBUG:
-                print(f"[PROTO] Assembly error: {e}")
-            self._reset()
-            return None
-    
-    def _reset(self):
-        """Сбрасывает состояние сборщика"""
-        self._current_frame_id = None
-        self._packets.clear()
-        self._expected_packets = None
-    
-    def force_reset(self):
-        """Принудительный сброс (публичный метод)"""
-        self._reset()
-
-
-# Тестирование протокола
-if __name__ == "__main__":
-    import os
-    
-    # Тестовые данные (имитация сжатого кадра)
-    test_data = os.urandom(200)  # 200 байт - потребует 2 пакета
-    
-    print(f"Original data size: {len(test_data)} bytes")
-    
-    # Создаем пакеты
-    packets = PacketBuilder.create_packets(test_data, frame_id=42)
-    print(f"Created {len(packets)} packets")
-    
-    for i, pkt in enumerate(packets):
-        print(f"  Packet {i}: {len(pkt)} bytes")
-    
-    # Симулируем прием
-    parser = PacketParser()
-    assembler = FrameAssembler()
-    
-    # Передаем пакеты "по сети" (с возможными фрагментами)
-    all_data = b''.join(packets)
-    
-    # Имитируем фрагментированный прием
-    chunk_size = 50
-    for i in range(0, len(all_data), chunk_size):
-        chunk = all_data[i:i + chunk_size]
-        
-        parsed_packets = parser.feed(chunk)
-        for pkt in parsed_packets:
-            print(f"Received packet: frame={pkt.frame_id}, seq={pkt.packet_seq}, len={pkt.data_len}")
-            
-            frame = assembler.add_packet(pkt)
-            if frame:
-                print(f"Frame assembled! Size: {len(frame)} bytes")
-                print(f"Data match: {frame == test_data}")
+        """Сброс состояния парсера"""
+        self.buffer.clear()
+        self.frame_buffers.clear()
+        self.current_frame_id = None
